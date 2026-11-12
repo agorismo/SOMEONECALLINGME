@@ -333,7 +333,9 @@ const $ = id => document.getElementById(id);
 
 const PREFIX = 'sala-';
 const MAX_NAME = 10;
-const MAX_AVATAR_BYTES = 800 * 1024;
+const MAX_GIF_BYTES = 10 * 1024 * 1024;
+const STATIC_AVATAR_PX = 512;
+const CHUNK_CHARS = 60000;
 
 const ICON_PATHS = {
   mic: '<path d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3z"/><path d="M19 11a7 7 0 0 1-14 0M12 18v3"/>',
@@ -430,18 +432,13 @@ $('avatar-file').addEventListener('change', async e => {
   try {
     let dataUrl;
     if (file.type === 'image/gif') {
-      if (file.size > MAX_AVATAR_BYTES) {
-        setLobbyError('Esse GIF é muito pesado. Use um com até 800 KB.');
+      if (file.size > MAX_GIF_BYTES) {
+        setLobbyError('Esse GIF é muito pesado. Use um com até 10 MB.');
         return;
       }
       dataUrl = await readAsDataURL(file);
     } else {
-      dataUrl = await shrinkImage(file, 256);
-    }
-
-    if (dataUrl.length > MAX_AVATAR_BYTES) {
-      setLobbyError('Essa imagem ainda ficou pesada. Escolha outra.');
-      return;
+      dataUrl = await shrinkImage(file, STATIC_AVATAR_PX);
     }
 
     myProfile.avatar = dataUrl;
@@ -531,7 +528,7 @@ function updatePeerBar() {
 
 async function startMedia() {
   localStream = await navigator.mediaDevices.getUserMedia({
-    video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } },
+    video: { facingMode: 'user', width: { ideal: 3840 }, height: { ideal: 2160 }, frameRate: { ideal: 30 } },
     audio: { echoCancellation: true, noiseSuppression: true }
   });
   $('local').srcObject = localStream;
@@ -541,16 +538,43 @@ async function startMedia() {
 
 function setupDataConn(conn) {
   dataConn = conn;
-  conn.on('open', () => {
-    conn.send({ type: 'profile', name: myProfile.name, avatar: myProfile.avatar });
-  });
+
+  const ready = () => {
+    conn.send({ type: 'profile', name: myProfile.name });
+    sendAvatar(conn, myProfile.avatar);
+  };
+  if (conn.open) ready(); else conn.on('open', ready);
+
+  const incoming = {};
   conn.on('data', msg => {
-    if (msg && msg.type === 'profile') {
-      peerProfile = { name: msg.name || '', avatar: msg.avatar || '' };
+    if (!msg || !msg.type) return;
+    if (msg.type === 'profile') {
+      peerProfile.name = msg.name || '';
       updatePeerBar();
       showToast((peerProfile.name || 'Alguém') + ' entrou na sala');
+    } else if (msg.type === 'avatar-start') {
+      incoming[msg.id] = [];
+    } else if (msg.type === 'avatar-chunk') {
+      if (incoming[msg.id]) incoming[msg.id].push(msg.data);
+    } else if (msg.type === 'avatar-end') {
+      if (incoming[msg.id]) {
+        peerProfile.avatar = incoming[msg.id].join('');
+        delete incoming[msg.id];
+        updatePeerBar();
+      }
     }
   });
+}
+
+// Envia a foto em pedaços, para aguentar arquivos grandes (GIF de até 10 MB)
+function sendAvatar(conn, dataUrl) {
+  if (!dataUrl) return;
+  const id = Math.random().toString(36).slice(2);
+  conn.send({ type: 'avatar-start', id });
+  for (let i = 0; i < dataUrl.length; i += CHUNK_CHARS) {
+    conn.send({ type: 'avatar-chunk', id, data: dataUrl.slice(i, i + CHUNK_CHARS) });
+  }
+  conn.send({ type: 'avatar-end', id });
 }
 
 async function enter(host) {
@@ -586,11 +610,6 @@ async function enter(host) {
     peer = new Peer(PREFIX + roomCode);
 
     peer.on('connection', conn => {
-      peerProfile = {
-        name: (conn.metadata && conn.metadata.name) || '',
-        avatar: (conn.metadata && conn.metadata.avatar) || ''
-      };
-      updatePeerBar();
       setupDataConn(conn);
     });
 
@@ -611,9 +630,7 @@ async function enter(host) {
     peer = new Peer();
 
     peer.on('open', () => {
-      const conn = peer.connect(PREFIX + roomCode, {
-        metadata: { name: myProfile.name, avatar: myProfile.avatar }
-      });
+      const conn = peer.connect(PREFIX + roomCode);
       setupDataConn(conn);
 
       const outgoing = peer.call(PREFIX + roomCode, localStream);
@@ -640,6 +657,7 @@ function attach(c) {
     $('overlay').classList.add('hidden');
     $('overlay-code').hidden = true;
     setDot('live');
+    boostBitrate();
     showToast('Conectado');
   });
   c.on('close', () => setStatus('A chamada foi encerrada.', 'ended', true));
@@ -677,6 +695,22 @@ $('btn-cam').onclick = () => {
   showToast(track.enabled ? 'Câmera ligada' : 'Câmera desligada');
 };
 
+async function boostBitrate() {
+  const pc = call && call.peerConnection;
+  if (!pc) return;
+  const sender = pc.getSenders().find(s => s.track && s.track.kind === 'video');
+  if (!sender) return;
+  try {
+    const params = sender.getParameters();
+    if (!params.encodings || !params.encodings.length) params.encodings = [{}];
+    params.encodings[0].maxBitrate = 12000000;
+    params.encodings[0].maxFramerate = 30;
+    await sender.setParameters(params);
+  } catch (e) {
+    // Navegador não permitiu ajustar; segue com a qualidade automática
+  }
+}
+
 async function replaceSentVideo(track) {
   const pc = call && call.peerConnection;
   if (!pc) return;
@@ -693,7 +727,10 @@ $('btn-screen').onclick = async () => {
   }
 
   try {
-    const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
+    const stream = await navigator.mediaDevices.getDisplayMedia({
+      video: { width: { ideal: 3840 }, height: { ideal: 2160 }, frameRate: { ideal: 30 } },
+      audio: false
+    });
     screenTrack = stream.getVideoTracks()[0];
     screenTrack.onended = () => stopScreen();
     await replaceSentVideo(screenTrack);
